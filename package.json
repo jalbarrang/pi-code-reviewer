@@ -67,5 +67,8 @@
     "typebox": {
       "optional": true
     }
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
