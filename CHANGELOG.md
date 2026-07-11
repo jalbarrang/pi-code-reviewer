@@ -1,5 +1,12 @@
 # @dreki-gg/pi-code-reviewer
 
+## [0.9.0](https://github.com/jalbarrang/pi-code-reviewer/compare/v0.8.0...v0.9.0) (2026-07-11)
+
+
+### Features
+
+* extract pi-code-reviewer from dreki-gg/pi-extensions monorepo ([f3524ed](https://github.com/jalbarrang/pi-code-reviewer/commit/f3524ed8b77a1b866be6f3df54f241b455b86b53))
+
 ## 0.8.0
 
 ### Minor Changes
