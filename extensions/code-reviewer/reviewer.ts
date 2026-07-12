@@ -8,7 +8,15 @@ import { Effect } from 'effect';
 
 import type { DiffSource } from './diff';
 import { Executor, makeExecutorService } from './effects/exec';
-import type { LensConfig, LensResult, PipelineResult, ValidatedFinding } from './types';
+import type {
+  EngineResult,
+  Finding,
+  LensConfig,
+  LensFinding,
+  LensResult,
+  LensSeverity,
+  VerificationStatus,
+} from './types';
 
 const isWindows = platform() === 'win32';
 
@@ -89,7 +97,7 @@ export function buildDiffSection(diff: DiffSource): string {
   parts.push('```');
   if (diffTruncated) {
     parts.push(
-      `> ⚠️ Diff truncated (${diff.diff.length} chars → ~${maxDiffLen}). Some files may not appear above; re-run scoped with \`--base\` or per-area if needed.`,
+      `> ⚠️ Diff truncated (${diff.diff.length} chars → ~${maxDiffLen}). Some files may not appear above; re-run scoped with \`--branch\` or per-area if needed.`,
     );
   }
   parts.push('');
@@ -187,98 +195,170 @@ export function buildPointer(pointer: ReviewPointer, mode: 'single-pass' | 'pipe
   ].join('\n');
 }
 
-const SEVERITY_EMOJI: Record<ValidatedFinding['severity'], string> = {
-  blocker: '🔴',
-  warning: '🟡',
-  note: '🔵',
+// ── Tiered report (finder + verifier engine) ─────────────────────────────────
+
+type Tier = 'Critical' | 'Important' | 'Minor';
+
+const TIER_ORDER: Tier[] = ['Critical', 'Important', 'Minor'];
+const TIER_EMOJI: Record<Tier, string> = { Critical: '🔴', Important: '🟡', Minor: '🔵' };
+
+/** Lens blocker/warning/note map directly onto the numeric tiers. */
+const LENS_TIER: Record<LensSeverity, Tier> = {
+  blocker: 'Critical',
+  warning: 'Important',
+  note: 'Minor',
 };
 
-/** A one-line model summary, shown only when a non-default model is in play. */
-function renderModelLine(telemetry: PipelineResult['telemetry']): string[] {
-  const passKeys = new Set(telemetry.passModels);
-  const allDefault =
-    passKeys.size === 1 && passKeys.has('default') && telemetry.validatorModel === 'default';
-  if (allDefault) return [];
-
-  const passCounts = new Map<string, number>();
-  for (const key of telemetry.passModels) passCounts.set(key, (passCounts.get(key) ?? 0) + 1);
-  const passSummary = [...passCounts.entries()].map(([key, count]) => `${key}×${count}`).join(', ');
-  return [`Models — passes: ${passSummary}; validator: ${telemetry.validatorModel}.`];
+/**
+ * Highest tier a numeric finding qualifies for (severity 1–10 + confidence
+ * 0–100), or null when it falls below the Minor floor. Thresholds mirror
+ * `references/review.md` Step 5.
+ */
+function tierForFinding(finding: Finding): Tier | null {
+  if (finding.severity >= 8 && finding.confidence >= 70) return 'Critical';
+  if (finding.severity >= 5 && finding.confidence >= 60) return 'Important';
+  if (finding.severity >= 3 && finding.confidence >= 50) return 'Minor';
+  return null;
 }
 
-/** Render the validated pipeline findings into a Markdown review report. */
-export function renderPipelineReport(result: PipelineResult, diff: DiffSource): string {
-  const { findings, telemetry } = result;
-  const counts = {
-    blocker: findings.filter((finding) => finding.severity === 'blocker').length,
-    warning: findings.filter((finding) => finding.severity === 'warning').length,
-    note: findings.filter((finding) => finding.severity === 'note').length,
-  };
+function loc(file: string, line?: string | number): string {
+  return line ? `\`${file}:${line}\`` : `\`${file}\``;
+}
+
+function renderFindingLine(finding: Finding, tier: Tier): string {
+  const meta = [
+    `severity ${finding.severity}`,
+    `confidence ${finding.confidence}%`,
+    finding.category,
+  ]
+    .filter(Boolean)
+    .join(', ');
+  const unverified = finding.unverified ? ` · ${finding.unverifiedTag ?? 'unverified'}` : '';
+  return `- ${TIER_EMOJI[tier]} **${tier}** ${loc(finding.file, finding.lineRange)} — ${finding.summary} _(${meta})_${unverified}`;
+}
+
+function renderLensLine(lensName: string, finding: LensFinding, tier: Tier): string {
+  return `- ${TIER_EMOJI[tier]} **${finding.severity}** ${loc(finding.file, finding.line)} — ${finding.message} _(lens: ${lensName})_`;
+}
+
+function verificationLabel(status: VerificationStatus): string {
+  switch (status) {
+    case 'ran':
+      return 'ran';
+    case 'skipped':
+      return 'skipped (low-risk diff)';
+    case 'failed-open':
+      return 'verifier failed — findings reported unverified';
+    case 'disabled':
+      return 'disabled (verify=false)';
+    case 'no-findings':
+      return 'skipped (low-risk diff; no findings)';
+  }
+}
+
+/**
+ * Dismissed (verifier ran only) + Lenses + Verification + Metadata sections
+ * shared by clean and populated reports.
+ */
+function renderFooter(
+  result: EngineResult,
+  lensNames: string[],
+  changedFiles: string[] | undefined,
+  finalCount: number,
+): string[] {
+  const { dismissed, telemetry } = result;
+  const out: string[] = [];
+
+  // Dismissals exist only when the verifier actually ran, so their presence is
+  // the gate — never render an empty Dismissed section on a skipped review.
+  if (dismissed.length > 0) {
+    out.push(`## Dismissed (${dismissed.length})`, '');
+    for (const item of dismissed) {
+      out.push(
+        `- ${loc(item.finding.file, item.finding.lineRange)} — ${item.finding.summary} _(${item.reason})_`,
+      );
+    }
+    out.push('');
+  }
+
+  const postVerification =
+    telemetry.postVerificationCount === null ? 'n/a' : String(telemetry.postVerificationCount);
+
+  out.push(
+    `**Lenses**: ${lensNames.length > 0 ? lensNames.join(', ') : 'none'}`,
+    `**Verification**: ${verificationLabel(telemetry.verification)}`,
+    '',
+    '**Metadata**',
+    `- files reviewed: ${changedFiles?.length ?? 'n/a'}`,
+    `- discovery: ${telemetry.discoveryCount}`,
+    `- post-verification: ${postVerification}`,
+    `- final: ${finalCount}`,
+  );
+  return out;
+}
+
+/**
+ * Render an {@link EngineResult} into a tiered Markdown report
+ * (Critical/Important/Minor per `references/review.md` Step 5). A failed
+ * discovery pass is reported as inconclusive — NEVER as a clean review — and a
+ * genuinely empty result says so plainly without inventing concerns.
+ */
+export function renderTieredReport(
+  result: EngineResult,
+  diff: DiffSource,
+  lensNames: string[],
+  changedFiles?: string[],
+): string {
+  const { findings, lensFindings, telemetry } = result;
 
   const header = [
     `# Code Review — ${new Date().toISOString().slice(0, 10)}`,
     '',
-    `Reviewed ${diff.label} across ${telemetry.passes} adversarial pass(es)` +
-      `${telemetry.failedPasses ? ` (${telemetry.failedPasses} failed)` : ''}.`,
-    '',
-    `**${findings.length} finding(s)** — ${counts.blocker} blocker, ${counts.warning} warning, ${counts.note} note.`,
-    `Pipeline: ${telemetry.buckets} buckets → ${telemetry.candidates} candidates → ${telemetry.validated} validated` +
-      ` (dropped ${telemetry.droppedFalsePositives} false-positive, ${telemetry.droppedLowSignal} low-signal).`,
-    ...renderModelLine(telemetry),
+    `Reviewed ${diff.label}.`,
     '',
   ];
 
-  // A pass fails when its model call errors; failures are swallowed into 0
-  // findings, so an all-failed run must NOT masquerade as a clean review.
-  const someFailed = telemetry.failedPasses > 0;
-  const allFailed = telemetry.passes > 0 && telemetry.failedPasses >= telemetry.passes;
-  const errSuffix = telemetry.passErrorSample ? ` — e.g. ${telemetry.passErrorSample}` : '';
-
-  if (findings.length === 0) {
-    if (allFailed) {
-      return [
-        ...header,
-        `> ⚠️ **Inconclusive — all ${telemetry.passes} review pass(es) failed${errSuffix}.**`,
-        '> No analysis actually ran; this is NOT a clean result. Re-run the review',
-        '> (check that the review model / pi-ai is available) before trusting it.',
-      ].join('\n');
-    }
-    if (someFailed) {
-      return [
-        ...header,
-        `> ⚠️ **Partial review — ${telemetry.failedPasses}/${telemetry.passes} pass(es) failed${errSuffix}.**`,
-        `> The ${telemetry.passes - telemetry.failedPasses} surviving pass(es) found nothing, but coverage was reduced.`,
-      ].join('\n');
-    }
-    return [...header, 'No bugs found that survived validation. ✅'].join('\n');
+  // The finder produced no usable output → inconclusive, NOT a clean review.
+  if (telemetry.finderFailed && findings.length === 0) {
+    const sample = telemetry.finderErrorSample ? ` — ${telemetry.finderErrorSample}` : '';
+    return [
+      ...header,
+      `> ⚠️ **Inconclusive — the discovery pass failed${sample}.**`,
+      '> No analysis actually ran; this is NOT a clean result. Re-run the review',
+      '> (check that the review model is available) before trusting it.',
+    ].join('\n');
   }
 
-  const partialWarning = someFailed
-    ? [
-        `> ⚠️ **Partial review — ${telemetry.failedPasses}/${telemetry.passes} pass(es) failed${errSuffix}; findings below may be incomplete.**`,
-        '',
-      ]
-    : [];
+  const tiers: Record<Tier, string[]> = { Critical: [], Important: [], Minor: [] };
+  let rendered = 0;
+  for (const finding of findings) {
+    const tier = tierForFinding(finding);
+    if (!tier) continue;
+    tiers[tier].push(renderFindingLine(finding, tier));
+    rendered += 1;
+  }
+  for (const [lensName, lensList] of Object.entries(lensFindings)) {
+    for (const finding of lensList) {
+      const tier = LENS_TIER[finding.severity];
+      tiers[tier].push(renderLensLine(lensName, finding, tier));
+      rendered += 1;
+    }
+  }
 
-  // Only attribute models per finding when more than one distinct model ran
-  // (a bake-off); with a single model it's noise.
-  const multiModel = new Set(telemetry.passModels).size > 1;
-  const lines = findings.map((finding) => {
-    const where = finding.line ? `\`${finding.file}:${finding.line}\`` : `\`${finding.file}\``;
-    const meta = [
-      `${finding.votes}/${telemetry.passes} votes`,
-      `${Math.round(finding.confidence * 100)}% conf`,
-      finding.category,
-      multiModel && finding.models.length > 0 ? `models: ${finding.models.join(', ')}` : undefined,
-      finding.previouslyRejected ? '⟲ previously rejected' : undefined,
-    ]
-      .filter(Boolean)
-      .join(', ');
-    const justification = finding.justification ? `\n  ↳ ${finding.justification}` : '';
-    return `- ${SEVERITY_EMOJI[finding.severity]} **${finding.severity}** ${where} — ${finding.message} _(${meta})_${justification}`;
-  });
+  const body: string[] = [];
+  for (const tier of TIER_ORDER) {
+    const lines = tiers[tier];
+    if (lines.length === 0) continue;
+    body.push(`## ${tier} (${lines.length})`, '', ...lines, '');
+  }
 
-  return [...header, ...partialWarning, '## Findings', '', ...lines].join('\n');
+  const footer = renderFooter(result, lensNames, changedFiles, rendered);
+
+  if (rendered === 0) {
+    return [...header, 'No confirmed findings. ✅', '', ...footer].join('\n');
+  }
+
+  return [...header, ...body, ...footer].join('\n');
 }
 
 /** Build the lens-specific section of the review prompt (no diff duplication). */
@@ -435,54 +515,6 @@ export async function buildSinglePassResult(
     });
     return { content: [{ type: 'text', text: fullContext }], details: baseDetails };
   }
-}
-
-/**
- * Assemble the pipeline result. The validated findings are the valuable output
- * and stay inline; the diff + lens context is spilled to a temp file (via the
- * injected {@link ReviewTempWriter}) purely so the agent can drill into the
- * diff behind a finding. A write failure must NOT discard a completed pipeline,
- * so on failure the findings are returned WITHOUT a pointer.
- */
-export async function buildPipelineResult(
-  args: {
-    pipeline: PipelineResult;
-    diff: DiffSource;
-    basePrompt: string;
-    lensNames: string[];
-    availableLenses: string[];
-    changedFiles: string[];
-  },
-  writeTemp: ReviewTempWriter,
-  onUpdate?: AgentToolUpdateCallback,
-): Promise<ReviewToolResult> {
-  const report = renderPipelineReport(args.pipeline, args.diff);
-  let text = report;
-  let contextFile: string | undefined;
-  try {
-    const pointer = await writeTemp(args.basePrompt);
-    text = `${report}\n\n${buildPointer(pointer, 'pipeline')}`;
-    contextFile = pointer.path;
-  } catch (cause) {
-    onUpdate?.({
-      content: [
-        { type: 'text', text: 'temp-file write failed — findings returned without diff pointer' },
-      ],
-      details: { writeError: cause instanceof Error ? cause.message : String(cause) },
-    });
-  }
-  return {
-    content: [{ type: 'text', text }],
-    details: {
-      mode: 'pipeline',
-      lensCount: args.lensNames.length,
-      availableLenses: args.availableLenses,
-      changedFiles: args.changedFiles,
-      findings: args.pipeline.findings,
-      telemetry: args.pipeline.telemetry,
-      ...(contextFile ? { contextFile } : {}),
-    },
-  };
 }
 
 /** Promise wrapper: run a deduped tool set once, building a live Executor from `pi`. */

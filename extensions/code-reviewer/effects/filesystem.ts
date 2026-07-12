@@ -7,7 +7,7 @@
  */
 
 import { Context, Effect } from 'effect';
-import { readFile, readdir } from 'node:fs/promises';
+import { readFile, readdir, realpath } from 'node:fs/promises';
 
 import { FileReadError } from '../errors';
 
@@ -16,6 +16,8 @@ export interface FileSystemService {
   readonly readTextFile: (path: string) => Effect.Effect<string, FileReadError>;
   /** List directory entries, failing with FileReadError when the dir is missing. */
   readonly readDirectory: (path: string) => Effect.Effect<string[], FileReadError>;
+  /** Resolve symlinks to a canonical path, failing when the path is missing. */
+  readonly realPath: (path: string) => Effect.Effect<string, FileReadError>;
 }
 
 export class FileSystem extends Context.Tag('CodeReviewer/FileSystem')<
@@ -33,6 +35,12 @@ export const nodeFileSystemService: FileSystemService = {
   readDirectory: (path) =>
     Effect.tryPromise({
       try: () => readdir(path),
+      catch: (cause) => new FileReadError({ path, cause }),
+    }),
+
+  realPath: (path) =>
+    Effect.tryPromise({
+      try: () => realpath(path),
       catch: (cause) => new FileReadError({ path, cause }),
     }),
 };

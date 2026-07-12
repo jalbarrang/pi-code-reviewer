@@ -1,5 +1,22 @@
 # @dreki-gg/pi-code-reviewer
 
+## Unreleased
+
+### Breaking Changes
+
+- feat!(code-reviewer): align with the canonical code-reviewer skill — replace the Bugbot-style multi-pass pipeline with a finder + verifier engine, and require a per-project review context.
+
+  - **Mandatory review context.** `.code-reviewer/context.md` is now required: `/review`, `/review-learn`, `/review-lenses`, and the `code_review` tool hard-fail with `code-reviewer is not initialized for this project — run /review-init first.` `/review-status` reports the uninitialized state and stops. There is no degraded review and no silent auto-generation.
+  - **Setup via `/review-init`.** An interactive scan + short interview writes `context.md`, then offers the packaged lens catalog (default none), copying the chosen lenses into `.code-review/lenses/` and merging `defaultLenses`. It never overwrites an existing context silently.
+  - **Finder + conditional verifier engine.** One context-grounded discovery call, a verifier gate that skips low-risk diffs (all severity < 5 and no finding touching Critical-invariant / Historical-bug-class paths) while still reporting findings tagged `unverified`, then a skeptical verifier that fails open. Reports are tiered Critical/Important/Minor (🔴🟡🔵) with Dismissed / Lenses / Verification / Metadata sections.
+  - **New commands.** `/review-learn [note]` (fold a false positive or miss into the context) and `/review-status` (read-only context health). `/review-lenses` also lists catalog lenses not yet enabled.
+  - **New lens catalog.** Five canonical lenses — `clean-code`, `ddd`, `security`, `concurrency`, `api-compat` — replace the previous four. Copies are project-owned and never auto-synced.
+  - **Config.** `review.finderModel`, `review.verifierModel`, `review.verify`, and `review.maxFindings` (each model step is a spec string or `{ model, reasoning }`). Unknown/legacy keys are ignored silently.
+  - **`--base` kept as an alias for `--branch`;** `--repo`/`--cwd` still redirect git/config/lens/context resolution to a worktree or sibling repo.
+  - **Vendored canonical skill.** `skills/code-reviewer/` is a verbatim copy of the canonical skill, refreshed with `bun run sync:canonical` (source `../skills/code-reviewer`, override via `--from` or `CODE_REVIEWER_CANONICAL`).
+
+  **Removed** (superseded by the context learn loop): multi-pass voting and temperature jitter (`review.passes`, `review.concurrency`, `review.temperature`), `review.minVotes`, the model bake-off (`review.passModel` / `review.passModels`, `review.validate` / `review.validateModel`), and recorded rejections (`.code-review/rejections.jsonl`, `review.recordRejections`, `rejectionsFile`). When a review gets something wrong, `/review-learn` folds the lesson into `context.md` and the verifier honors it thereafter.
+
 ## [0.9.1](https://github.com/jalbarrang/pi-code-reviewer/compare/v0.9.0...v0.9.1) (2026-07-12)
 
 

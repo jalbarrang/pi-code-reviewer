@@ -7,7 +7,7 @@
  * the session CWD (so relative worktree paths like `../project-pr35` work) and
  * validated with a single `git rev-parse --is-inside-work-tree` — that one call
  * rejects both a missing directory and a non-git path. The session CWD itself is
- * never mutated; this only redirects git/config/lens/rejections resolution.
+ * never mutated; this only redirects git/config/lens/context resolution.
  */
 
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';

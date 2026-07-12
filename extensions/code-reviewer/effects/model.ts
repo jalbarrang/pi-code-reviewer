@@ -1,13 +1,17 @@
 /**
  * Reviewer service — wraps the session's current model so a single completion
- * becomes an injectable, typed Effect. The self-driving pipeline (see
- * `passes.ts`) depends on this Tag; the live implementation drives
- * `@earendil-works/pi-ai`'s `completeSimple` over `ctx.model`, while tests
- * provide a deterministic fake instead of calling a real provider.
+ * becomes an injectable, typed Effect. The finder+verifier engine depends on
+ * this Tag; the live implementation drives `completeSimple` from
+ * `@earendil-works/pi-ai/compat` over `ctx.model`, while tests provide a
+ * deterministic fake instead of calling a real provider.
  *
  * `@earendil-works/pi-ai` is an OPTIONAL peer dependency, so the runtime import
  * is deferred (`import()`), reached only when the harness actually hands us a
  * model. The extension stays loadable in environments without pi-ai.
+ *
+ * Note: as of pi-ai 0.75+/0.80, `completeSimple` lives on the `/compat`
+ * entrypoint (not the package root). Types (`Model`, `Api`, …) still come from
+ * `@earendil-works/pi-ai`.
  */
 
 import type { Api, AssistantMessage, Model, TextContent } from '@earendil-works/pi-ai';
@@ -25,7 +29,7 @@ export type CompletionRequest = {
   modelKey: string;
   system: string;
   user: string;
-  /** Sampling temperature; the pipeline jitters this per pass. */
+  /** Sampling temperature for this call. */
   temperature?: number;
   /** Reasoning/thinking effort for this call (provider-dependent). */
   reasoning?: ReasoningLevel;
@@ -87,6 +91,7 @@ export function makeReviewerService(resolution: ModelResolution): ReviewerServic
     complete: (request) =>
       Effect.tryPromise({
         try: async () => {
+          // completeSimple is exported from /compat only (not package root).
           const { completeSimple } = await import('@earendil-works/pi-ai/compat');
           const model = resolution.byKey.get(request.modelKey) ?? resolution.defaultModel;
           const message = await completeSimple(

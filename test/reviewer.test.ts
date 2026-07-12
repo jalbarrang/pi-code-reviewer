@@ -4,17 +4,17 @@ import { Effect } from 'effect';
 import {
   buildInlineSummary,
   buildLensResult,
-  buildPipelineResult,
   buildPointer,
   buildSinglePassResult,
   pickLensToolOutputs,
-  renderPipelineReport,
+  renderTieredReport,
   runToolsEffect,
 } from '../extensions/code-reviewer/reviewer';
 import type {
+  EngineResult,
+  EngineTelemetry,
+  Finding,
   LensConfig,
-  PipelineTelemetry,
-  ValidatedFinding,
 } from '../extensions/code-reviewer/types';
 import type { DiffSource } from '../extensions/code-reviewer/diff';
 import { fakeExecutor } from './helpers';
@@ -31,103 +31,202 @@ const opts = { timeoutMs: 60_000, concurrency: 4 };
 
 const diffSource: DiffSource = { diff: 'x', stat: 's', label: 'all uncommitted changes' };
 
-function telemetry(over: Partial<PipelineTelemetry> = {}): PipelineTelemetry {
+function telemetry(over: Partial<EngineTelemetry> = {}): EngineTelemetry {
   return {
-    passes: 5,
-    passFindingCounts: [],
-    buckets: 0,
-    candidates: 0,
-    validated: 0,
-    droppedFalsePositives: 0,
-    droppedLowSignal: 0,
-    failedPasses: 0,
-    passModels: ['default', 'default', 'default', 'default', 'default'],
-    validatorModel: 'default',
+    discoveryCount: 0,
+    postVerificationCount: null,
+    finalCount: 0,
+    verification: 'no-findings',
+    finderModel: 'default',
+    verifierModel: 'default',
     ...over,
   };
 }
 
-describe('renderPipelineReport', () => {
-  test('clean run (no failures, no findings) shows the green check', () => {
-    const report = renderPipelineReport(
-      { findings: [], rejected: [], telemetry: telemetry() },
-      diffSource,
-    );
+function engineResult(over: Partial<EngineResult> = {}): EngineResult {
+  return {
+    findings: [],
+    dismissed: [],
+    lensFindings: {},
+    telemetry: telemetry(),
+    ...over,
+  };
+}
+
+const critical: Finding = {
+  file: 'src/auth/session.ts',
+  lineRange: '42',
+  category: 'security',
+  severity: 9,
+  confidence: 90,
+  summary: 'token not validated',
+  reasoning: 'reachable',
+};
+
+const important: Finding = {
+  file: 'src/api/handler.ts',
+  lineRange: '10-14',
+  category: 'null-safety',
+  severity: 6,
+  confidence: 70,
+  summary: 'possible null deref',
+  reasoning: 'missing guard',
+};
+
+const minorUnverified: Finding = {
+  file: 'src/util/fmt.ts',
+  lineRange: '3',
+  category: 'logic',
+  severity: 4,
+  confidence: 55,
+  summary: 'edge case',
+  reasoning: 'unlikely',
+  unverified: true,
+  unverifiedTag: 'unverified — below verification threshold',
+};
+
+const belowFloor: Finding = {
+  file: 'src/util/noise.ts',
+  category: 'logic',
+  severity: 2,
+  confidence: 30,
+  summary: 'noise',
+  reasoning: 'ignore',
+};
+
+describe('renderTieredReport', () => {
+  test('clean run plainly says no confirmed findings, never invents concerns', () => {
+    const report = renderTieredReport(engineResult(), diffSource, []);
+    expect(report).toContain('No confirmed findings');
     expect(report).toContain('✅');
-    expect(report).not.toContain('Inconclusive');
+    expect(report).not.toContain('## Critical');
+    expect(report).toContain('**Lenses**: none');
+    expect(report).toContain('**Verification**: skipped (low-risk diff; no findings)');
   });
 
-  test('all passes failed with no findings is inconclusive, never a clean check', () => {
-    const report = renderPipelineReport(
-      {
-        findings: [],
-        rejected: [],
-        telemetry: telemetry({ failedPasses: 5, passErrorSample: 'model x unavailable' }),
-      },
+  test('finder failure is inconclusive, not a clean check', () => {
+    const report = renderTieredReport(
+      engineResult({
+        telemetry: telemetry({ finderFailed: true, finderErrorSample: 'model x unavailable' }),
+      }),
       diffSource,
+      [],
     );
     expect(report).not.toContain('✅');
     expect(report).toContain('Inconclusive');
     expect(report).toContain('model x unavailable');
   });
 
-  test('partial failure with no findings is flagged as partial, not clean', () => {
-    const report = renderPipelineReport(
-      { findings: [], rejected: [], telemetry: telemetry({ failedPasses: 2, passErrorSample: 'timeout' }) },
+  test('buckets findings into the highest tier they qualify for', () => {
+    const report = renderTieredReport(
+      engineResult({
+        findings: [critical, important, minorUnverified, belowFloor],
+        telemetry: telemetry({
+          discoveryCount: 4,
+          postVerificationCount: 3,
+          finalCount: 3,
+          verification: 'ran',
+        }),
+      }),
       diffSource,
+      ['code-quality'],
+      ['src/auth/session.ts', 'src/api/handler.ts', 'src/util/fmt.ts', 'src/util/noise.ts'],
     );
-    expect(report).not.toContain('✅');
-    expect(report).toContain('Partial');
-    expect(report).toContain('2/5');
+
+    expect(report).toContain('## Critical (1)');
+    expect(report).toContain('🔴 **Critical** `src/auth/session.ts:42` — token not validated');
+    expect(report).toContain('## Important (1)');
+    expect(report).toContain('🟡 **Important** `src/api/handler.ts:10-14`');
+    expect(report).toContain('## Minor (1)');
+    expect(report).toContain('🔵 **Minor** `src/util/fmt.ts:3`');
+    // Below-floor finding (sev 2 / conf 30) is dropped, not shown.
+    expect(report).not.toContain('src/util/noise.ts');
   });
 
-  test('findings present with some failed passes carry a partial-coverage warning', () => {
-    const finding: ValidatedFinding = {
-      file: 'a.ts',
-      line: 1,
-      severity: 'warning',
-      message: 'bug',
-      category: 'x',
-      votes: 2,
-      passIndices: [0, 1],
-      verdict: 'real',
-      confidence: 0.8,
-      models: ['default'],
-    };
-    const report = renderPipelineReport(
-      {
-        findings: [finding],
-        rejected: [],
-        telemetry: telemetry({ failedPasses: 1, buckets: 1, candidates: 1, validated: 1 }),
-      },
+  test('tags unverified findings and skips verification label', () => {
+    const report = renderTieredReport(
+      engineResult({
+        findings: [minorUnverified],
+        telemetry: telemetry({
+          discoveryCount: 1,
+          postVerificationCount: null,
+          finalCount: 1,
+          verification: 'skipped',
+        }),
+      }),
       diffSource,
+      [],
     );
-    expect(report).toContain('## Findings');
-    expect(report).toContain('Partial');
+    expect(report).toContain('unverified — below verification threshold');
+    expect(report).toContain('**Verification**: skipped (low-risk diff)');
+    expect(report).toContain('- post-verification: n/a');
   });
 
-  test('tags a previously-rejected finding in the report', () => {
-    const finding: ValidatedFinding = {
-      file: 'a.ts',
-      line: 1,
-      severity: 'warning',
-      message: 'bug',
-      votes: 2,
-      passIndices: [0, 1],
-      verdict: 'real',
-      confidence: 0.8,
-      models: ['default'],
-      previouslyRejected: true,
-    };
-    const report = renderPipelineReport(
-      {
-        findings: [finding],
-        rejected: [],
-        telemetry: telemetry({ buckets: 1, candidates: 1, validated: 1 }),
-      },
+  test('maps lens blocker/warning/note to tiers', () => {
+    const report = renderTieredReport(
+      engineResult({
+        lensFindings: {
+          security: [{ file: 'a.ts', line: 1, severity: 'blocker', message: 'xss' }],
+          quality: [{ file: 'b.ts', severity: 'note', message: 'dead code' }],
+        },
+        telemetry: telemetry({ discoveryCount: 0, finalCount: 2, verification: 'ran' }),
+      }),
       diffSource,
+      ['security', 'quality'],
     );
-    expect(report).toContain('previously rejected');
+    expect(report).toContain('## Critical (1)');
+    expect(report).toContain('🔴 **blocker** `a.ts:1` — xss _(lens: security)_');
+    expect(report).toContain('## Minor (1)');
+    expect(report).toContain('🔵 **note** `b.ts` — dead code _(lens: quality)_');
+  });
+
+  test('renders Dismissed only when the verifier produced dismissals', () => {
+    const withDismissals = renderTieredReport(
+      engineResult({
+        findings: [critical],
+        dismissed: [{ finding: important, reason: 'guarded upstream' }],
+        telemetry: telemetry({
+          discoveryCount: 2,
+          postVerificationCount: 1,
+          finalCount: 1,
+          verification: 'ran',
+        }),
+      }),
+      diffSource,
+      [],
+    );
+    expect(withDismissals).toContain('## Dismissed (1)');
+    expect(withDismissals).toContain('guarded upstream');
+
+    const noDismissals = renderTieredReport(
+      engineResult({ findings: [critical], telemetry: telemetry({ verification: 'skipped' }) }),
+      diffSource,
+      [],
+    );
+    expect(noDismissals).not.toContain('## Dismissed');
+  });
+
+  test('metadata reports files reviewed, discovery, post-verification and final counts', () => {
+    const report = renderTieredReport(
+      engineResult({
+        findings: [critical, important],
+        telemetry: telemetry({
+          discoveryCount: 5,
+          postVerificationCount: 2,
+          finalCount: 2,
+          verification: 'ran',
+        }),
+      }),
+      diffSource,
+      ['code-quality'],
+      ['a.ts', 'b.ts', 'c.ts'],
+    );
+    expect(report).toContain('**Lenses**: code-quality');
+    expect(report).toContain('**Verification**: ran');
+    expect(report).toContain('- files reviewed: 3');
+    expect(report).toContain('- discovery: 5');
+    expect(report).toContain('- post-verification: 2');
+    expect(report).toContain('- final: 2');
   });
 });
 
@@ -244,17 +343,8 @@ describe('buildPointer', () => {
     expect(out).toContain('offset/limit');
   });
 
-  test('pipeline: path, size, line count and a read offset/limit directive', () => {
-    const out = buildPointer(pointer, 'pipeline');
-    expect(out).toContain('/tmp/pi-code-review-123.md');
-    expect(out).toContain('842 lines');
-    expect(out).toContain('94KB');
-    expect(out).toContain('offset/limit');
-    expect(out).toContain('---');
-  });
-
   test('rounds tiny files up to at least 1KB', () => {
-    const out = buildPointer({ path: '/tmp/x.md', bytes: 10, lines: 1 }, 'pipeline');
+    const out = buildPointer({ path: '/tmp/x.md', bytes: 10, lines: 1 }, 'single-pass');
     expect(out).toContain('1KB');
   });
 });
@@ -275,9 +365,7 @@ describe('buildLensResult', () => {
 
 // Tool-result content is `(TextContent | ImageContent)[]`; these helpers only
 // ever emit text, so narrow to the text payload for assertions.
-function firstText(result: {
-  content: ReadonlyArray<{ type: string; text?: string }>;
-}): string {
+function firstText(result: { content: ReadonlyArray<{ type: string; text?: string }> }): string {
   const block = result.content[0];
   return block?.type === 'text' && block.text !== undefined ? block.text : '';
 }
@@ -356,62 +444,5 @@ describe('buildSinglePassResult', () => {
     expect(firstText(result)).toContain('## Instructions');
     expect(result.details).not.toHaveProperty('contextFile');
     expect(updates.some((u) => u.includes('temp-file write failed'))).toBe(true);
-  });
-});
-
-const validatedFinding: ValidatedFinding = {
-  file: 'a.ts',
-  line: 1,
-  severity: 'warning',
-  message: 'bug',
-  category: 'x',
-  votes: 2,
-  passIndices: [0, 1],
-  verdict: 'real',
-  confidence: 0.8,
-  models: ['default'],
-};
-
-const pipelineArgs = {
-  pipeline: {
-    findings: [validatedFinding],
-    rejected: [],
-    telemetry: telemetry({ buckets: 1, candidates: 1, validated: 1 }),
-  },
-  diff: diffSource,
-  basePrompt: '## diff + lens context',
-  lensNames: ['code-quality'],
-  availableLenses: ['code-quality'],
-  changedFiles: ['a.ts'],
-};
-
-describe('buildPipelineResult', () => {
-  test('keeps findings inline and appends a pointer to the spilled context', async () => {
-    const writer = okWriter();
-    const result = await buildPipelineResult(pipelineArgs, writer.write);
-
-    expect(writer.calls[0]).toBe('## diff + lens context');
-    const text = firstText(result);
-    expect(text).toContain('## Findings');
-    expect(text).toContain('bug');
-    expect(text).toContain('/tmp/pi-code-review-test.md');
-    expect(result.details.findings).toEqual([validatedFinding]);
-    expect(result.details.contextFile).toBe('/tmp/pi-code-review-test.md');
-  });
-
-  test('write failure still returns findings, just without a pointer', async () => {
-    const writer = failWriter();
-    const updates: string[] = [];
-    const result = await buildPipelineResult(pipelineArgs, writer.write, (u) =>
-      updates.push(firstText(u)),
-    );
-
-    const text = firstText(result);
-    expect(text).toContain('## Findings');
-    expect(text).toContain('bug');
-    expect(text).not.toContain('/tmp/pi-code-review-test.md');
-    expect(result.details.findings).toEqual([validatedFinding]);
-    expect(result.details).not.toHaveProperty('contextFile');
-    expect(updates.some((u) => u.includes('without diff pointer'))).toBe(true);
   });
 });

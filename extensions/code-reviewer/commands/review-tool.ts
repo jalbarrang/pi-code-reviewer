@@ -1,40 +1,18 @@
 import { writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
+import type { AgentToolUpdateCallback, ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
 
 import { loadConfig, getLensDir } from '../config';
-import { collectDiff, getChangedFiles } from '../diff';
-import { discoverLenses, getLensContent } from '../lenses';
+import { NOT_INITIALIZED, loadReviewContext } from '../context';
+import { discoverLenses } from '../lenses';
 import { resolveRepoCwd } from '../resolve-cwd';
-import { resolveModelPlan } from '../model-plan';
-import { runPipeline } from '../passes';
-import {
-  appendRejections,
-  applyRejections,
-  loadRejections,
-  toRejectionRecords,
-} from '../rejections';
-import {
-  buildLensResult,
-  buildPipelineResult,
-  buildReviewBasePrompt,
-  buildSinglePassResult,
-  pickLensToolOutputs,
-  runTools,
-} from '../reviewer';
-import type { ReviewPointer } from '../reviewer';
-import type { LensResult, ReviewConfig } from '../types';
+import { buildPointer, renderTieredReport, type ReviewPointer } from '../reviewer';
+import { runReview, resolveLensNames } from '../run';
 
-/**
- * Spill the full review context to a temp Markdown file and return a pointer
- * (path + byte size + line count). Both pi's tool-output and `read` caps are
- * ~50KB / 2000 lines, so large reviews would otherwise be truncated and lost
- * on compaction. The on-disk file survives compaction and can be paged.
- *
- * Node-only IO (no Bun) per the extension runtime constraint.
- */
+/** Spill large review output to a temp file so it survives pi's ~50KB tool-output
+ *  cap and context compaction. Node-only IO per the extension runtime constraint. */
 async function writeReviewTempFile(content: string): Promise<ReviewPointer> {
   const path = join(tmpdir(), `pi-code-review-${Date.now()}.md`);
   await writeFile(path, content, 'utf8');
@@ -45,29 +23,39 @@ async function writeReviewTempFile(content: string): Promise<ReviewPointer> {
   };
 }
 
+/** Inline payloads above this size spill to a temp file + pointer instead. */
+const INLINE_LIMIT_BYTES = 40_000;
+
 export function registerReviewTool(pi: ExtensionAPI) {
   pi.registerTool({
     name: 'code_review',
     label: 'Code Review',
     description:
-      'Run a multi-lens code review on the current working directory changes. Returns review findings grouped by lens.',
-    promptSnippet: 'Run a multi-lens code review against working directory changes',
+      'Run a context-aware bug review on working-directory changes using the finder+verifier engine. Requires the project to be initialized (.code-reviewer/context.md, via /review-init). Returns a tiered report (Critical/Important/Minor) plus structured details.',
+    promptSnippet: 'Run a context-aware bug review against working directory changes',
     promptGuidelines: [
-      'Use code_review when the user asks to review their changes, check code quality, or before committing.',
-      'code_review reads lens definitions from .code-review/lenses/ in the project root.',
+      'Use code_review when the user asks to review their changes, hunt for bugs, or check code before committing.',
+      'code_review REQUIRES an initialized project: it reads .code-reviewer/context.md and refuses when missing (tell the user to run /review-init).',
+      'Lenses are optional — a review with zero lenses is a valid context-driven bug hunt.',
     ],
     parameters: Type.Object({
       lenses: Type.Optional(
         Type.Array(Type.String(), {
           description:
-            'Specific lenses to apply. If omitted, uses project defaults or all available.',
+            'Specific lenses to apply. If omitted, uses project defaults or all available. Zero lenses is valid.',
+        }),
+      ),
+      branch: Type.Optional(
+        Type.String({
+          description: 'Base branch/ref for a merge-base (triple-dot) diff, e.g. "main".',
         }),
       ),
       base: Type.Optional(
         Type.String({
-          description: 'Git ref to diff against (e.g., "main", "HEAD~3"). Defaults to HEAD.',
+          description: 'Deprecated alias for branch.',
         }),
       ),
+      commit: Type.Optional(Type.String({ description: "Review a single commit's patch by sha." })),
       staged: Type.Optional(
         Type.Boolean({
           description: 'Review only staged changes instead of all working directory changes.',
@@ -76,7 +64,7 @@ export function registerReviewTool(pi: ExtensionAPI) {
       cwd: Type.Optional(
         Type.String({
           description:
-            'Override directory for git/config/lens resolution (e.g. a worktree or sibling repo). Resolved relative to the session directory and validated as a git work tree. The session directory is left unchanged.',
+            'Override directory for git/config/lens/context resolution (e.g. a worktree or sibling repo). Resolved relative to the session directory and validated as a git work tree. The session directory is left unchanged.',
         }),
       ),
     }),
@@ -96,188 +84,115 @@ export function registerReviewTool(pi: ExtensionAPI) {
           details: {},
         };
       }
+
+      // Mandatory context gate.
+      const context = await loadReviewContext(cwd);
+      if (!context) {
+        return {
+          content: [{ type: 'text', text: NOT_INITIALIZED }],
+          details: { initialized: false },
+        };
+      }
+
       const config = await loadConfig(cwd);
       const lensDir = getLensDir(cwd, config);
       const available = await discoverLenses(lensDir);
+      const lensNames = resolveLensNames(params.lenses, config.defaultLenses, available);
 
-      if (available.size === 0) {
+      ctx.ui.setStatus('code-review', '🔍 Collecting diff...');
+      let run;
+      try {
+        run = await runReview(pi, {
+          cwd,
+          config,
+          contextMarkdown: context.content,
+          diffOptions: {
+            branch: params.branch ?? params.base,
+            commit: params.commit,
+            staged: params.staged,
+          },
+          lensNames,
+          available,
+          lensDir,
+          model: ctx.model,
+          modelRegistry: ctx.modelRegistry,
+          onStage: (stage) => {
+            ctx.ui.setStatus('code-review', `🔍 ${stage}...`);
+            onUpdate?.({ content: [{ type: 'text', text: stage }], details: { stage } });
+          },
+          onWarning: (msg) => ctx.ui.notify(msg, 'warning'),
+          signal,
+        });
+      } catch (cause) {
+        ctx.ui.setStatus('code-review', undefined);
         return {
           content: [
             {
               type: 'text',
-              text: `No lenses found in ${config.lensDir}. Run /review-init to scaffold a default config, or create .code-review/lenses/*.md files.`,
+              text: `Review failed: ${cause instanceof Error ? cause.message : String(cause)}`,
             },
           ],
           details: {},
         };
       }
 
-      const lensNames = resolveLensNames(params.lenses, config, available);
-
-      ctx.ui.setStatus('code-review', '🔍 Collecting diff...');
-      const diff = await collectDiff(pi, cwd, {
-        base: params.base,
-        staged: params.staged,
-      });
-
-      if (!diff.diff.trim()) {
-        ctx.ui.setStatus('code-review', undefined);
-        return {
-          content: [{ type: 'text', text: 'No changes to review.' }],
-          details: {},
-        };
-      }
-
-      const selected = lensNames.map((name) => available.get(name)!);
-
-      // Run the DISTINCT tool set once (deduped across lenses), concurrently —
-      // not once per lens. A command shared by several lenses executes a single
-      // time and its output is shared.
-      const allTools = [...new Set(selected.flatMap((lens) => lens.tools))];
-      if (allTools.length > 0) {
-        ctx.ui.setStatus('code-review', `🔍 Running ${allTools.length} tool(s)...`);
-      }
-      const toolOutputs = await runTools(
-        pi,
-        cwd,
-        allTools,
-        { timeoutMs: config.toolTimeoutMs, concurrency: config.toolConcurrency },
-        signal,
-      );
-
-      const results: LensResult[] = [];
-      for (let i = 0; i < lensNames.length; i++) {
-        if (signal?.aborted) break;
-
-        const name = lensNames[i];
-        const progressMsg = `Lens ${i + 1}/${lensNames.length}: ${name}`;
-        ctx.ui.setStatus('code-review', `🔍 ${progressMsg}`);
-        onUpdate?.({
-          content: [{ type: 'text', text: progressMsg }],
-          details: { currentLens: name, lensIndex: i + 1, totalLenses: lensNames.length },
-        });
-
-        const lens = selected[i];
-        const content = (await getLensContent(lensDir, name)) ?? '';
-        results.push(buildLensResult(lens, content, pickLensToolOutputs(lens, toolOutputs)));
-      }
-
-      const changedFiles = await getChangedFiles(pi, cwd, {
-        base: params.base,
-        staged: params.staged,
-      });
-
-      // Self-driving path: when a model is available and passes are enabled,
-      // the tool runs the Bugbot-style pipeline itself (parallel adversarial
-      // passes → bucket → majority vote → validate) and returns FINISHED,
-      // validated findings — not a prompt for a single downstream pass.
-      const lensSections = results.map((result) => result._lensSection).filter(Boolean) as string[];
-      if (ctx.model && config.review.passes > 0 && lensSections.length > 0 && !signal?.aborted) {
-        try {
-          const { resolution, plan, warnings } = resolveModelPlan(
-            config.review,
-            ctx.model,
-            ctx.modelRegistry,
-          );
-          for (const warning of warnings) ctx.ui.notify(warning, 'warning');
-          const basePrompt = buildReviewBasePrompt(lensSections, diff);
-          const pipeline = await runPipeline(
-            resolution,
-            plan,
-            basePrompt,
-            config.review,
-            {
-              onStage: (stage) => {
-                ctx.ui.setStatus('code-review', `🔍 ${stage}...`);
-                onUpdate?.({ content: [{ type: 'text', text: stage }], details: { stage } });
-              },
-            },
-            signal,
-          );
-          ctx.ui.setStatus('code-review', undefined);
-          // Every pass failed (e.g. the review model/pi-ai was unavailable for
-          // each call). The swallowed failures would render as a misleading
-          // "0 findings" report — instead, degrade to the single-pass prompt so
-          // the reviewing agent still produces a real review.
-          const allPassesFailed =
-            config.review.passes > 0 && pipeline.telemetry.failedPasses >= config.review.passes;
-          if (!allPassesFailed) {
-            // Recorded rejections: downrank+tag findings the validator refuted on
-            // a previous run, then persist this run's false-positives. All FS is
-            // best-effort — it must never break a completed review.
-            if (config.review.recordRejections) {
-              const rejectionsPath = join(cwd, config.rejectionsFile);
-              const past = await loadRejections(rejectionsPath);
-              pipeline.findings = applyRejections(pipeline.findings, past);
-              await appendRejections(rejectionsPath, toRejectionRecords(pipeline.rejected));
-            }
-            return buildPipelineResult(
-              {
-                pipeline,
-                diff,
-                basePrompt,
-                lensNames,
-                availableLenses: [...available.keys()],
-                changedFiles,
-              },
-              writeReviewTempFile,
-              onUpdate,
-            );
-          }
-          onUpdate?.({
-            content: [{ type: 'text', text: 'all review passes failed — single-pass fallback' }],
-            details: {
-              failedPasses: pipeline.telemetry.failedPasses,
-              passError: pipeline.telemetry.passErrorSample,
-            },
-          });
-        } catch (cause) {
-          // Pipeline failed hard (e.g. model/pi-ai unavailable at runtime) —
-          // degrade to the single-pass prompt instead of failing the review.
-          ctx.ui.setStatus('code-review', undefined);
-          onUpdate?.({
-            content: [{ type: 'text', text: 'pipeline unavailable — single-pass fallback' }],
-            details: { pipelineError: cause instanceof Error ? cause.message : String(cause) },
-          });
-        }
-      }
-
       ctx.ui.setStatus('code-review', undefined);
 
-      // Fallback: spill the full single-pass review context to a temp file and
-      // return a compact summary + pointer (degrades gracefully on empty
-      // context or a write failure). Used when no model is available (e.g.
-      // print mode) or passes are disabled in config.
-      //
-      // This is the PRIMARY truncation culprit: the full context embeds the
-      // diff (up to 50KB) plus every lens's tool outputs (20KB each), which
-      // easily blows past pi's 50KB tool-output cap.
-      return buildSinglePassResult(
-        {
-          results,
-          diff,
-          lensNames,
-          availableLenses: [...available.keys()],
-          changedFiles,
-        },
-        writeReviewTempFile,
-        onUpdate,
-      );
+      if (run.kind === 'no-changes') {
+        return { content: [{ type: 'text', text: 'No changes to review.' }], details: {} };
+      }
+
+      const baseDetails: Record<string, unknown> = {
+        lensNames: run.lensNames,
+        availableLenses: [...available.keys()],
+        changedFiles: run.changedFiles,
+      };
+
+      // No session model → return the project-aware fallback prompt (spilled if
+      // large so it survives the tool-output cap).
+      if (run.kind === 'fallback') {
+        return spill(run.prompt, { ...baseDetails, mode: 'fallback' }, 'single-pass', onUpdate);
+      }
+
+      const report = renderTieredReport(run.result, run.diff, run.lensNames, run.changedFiles);
+      const { telemetry } = run.result;
+      const details = {
+        ...baseDetails,
+        mode: 'engine',
+        verification: telemetry.verification,
+        discoveryCount: telemetry.discoveryCount,
+        postVerificationCount: telemetry.postVerificationCount,
+        finalCount: telemetry.finalCount,
+        finderModel: telemetry.finderModel,
+        verifierModel: telemetry.verifierModel,
+        finderFailed: telemetry.finderFailed,
+      };
+      return spill(report, details, 'pipeline', onUpdate);
     },
   });
 }
 
-function resolveLensNames(
-  requested: string[] | undefined,
-  config: ReviewConfig,
-  available: Map<string, unknown>,
-): string[] {
-  if (requested && requested.length > 0) {
-    return requested.filter((l) => available.has(l));
+/** Return content inline when small; otherwise spill to temp + return a pointer. */
+async function spill(
+  content: string,
+  details: Record<string, unknown>,
+  mode: 'single-pass' | 'pipeline',
+  onUpdate?: AgentToolUpdateCallback,
+): Promise<{ content: { type: 'text'; text: string }[]; details: Record<string, unknown> }> {
+  if (Buffer.byteLength(content, 'utf8') <= INLINE_LIMIT_BYTES) {
+    return { content: [{ type: 'text', text: content }], details };
   }
-  if (config.defaultLenses.length > 0) {
-    return config.defaultLenses.filter((l) => available.has(l));
+  try {
+    const pointer = await writeReviewTempFile(content);
+    return {
+      content: [{ type: 'text', text: buildPointer(pointer, mode) }],
+      details: { ...details, contextFile: pointer.path },
+    };
+  } catch (cause) {
+    onUpdate?.({
+      content: [{ type: 'text', text: 'temp-file write failed — returning inline content' }],
+      details: { writeError: cause instanceof Error ? cause.message : String(cause) },
+    });
+    return { content: [{ type: 'text', text: content }], details };
   }
-  return [...available.keys()];
 }
-

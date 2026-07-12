@@ -9,7 +9,7 @@ import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { Effect } from 'effect';
 
 import { Executor, makeExecutorService } from './effects/exec';
-import type { ExecError } from './errors';
+import { ExecError } from './errors';
 
 export type DiffSource = {
   diff: string;
@@ -17,7 +17,16 @@ export type DiffSource = {
   label: string;
 };
 
-export type DiffOptions = { base?: string; staged?: boolean };
+export type DiffOptions = {
+  /** Merge-base triple-dot diff against this ref. */
+  branch?: string;
+  /** Single-commit patch for this sha. */
+  commit?: string;
+  /** Staged-only slice of uncommitted changes (back-compat). */
+  staged?: boolean;
+  /** @deprecated Use `branch`. Same semantics as `branch`. */
+  base?: string;
+};
 
 /** git diffs are normally instant; cap them so a pathological repo can't hang
  *  the whole review. */
@@ -37,6 +46,24 @@ function git(args: string[], cwd: string): Effect.Effect<string, ExecError, Exec
     const result = yield* executor.exec('git', args, { cwd, timeout: GIT_TIMEOUT_MS });
     return result.stdout;
   });
+}
+
+function gitEither(
+  args: string[],
+  cwd: string,
+): Effect.Effect<{ ok: true; stdout: string } | { ok: false }, never, Executor> {
+  return git(args, cwd).pipe(
+    Effect.map((stdout) => ({ ok: true as const, stdout })),
+    Effect.catchAll(() => Effect.succeed({ ok: false as const })),
+  );
+}
+
+function failGitRef(args: string[], message: string): Effect.Effect<never, ExecError> {
+  return Effect.fail(new ExecError({ command: 'git', args, cause: new Error(message) }));
+}
+
+function resolveBranchRef(options: DiffOptions): string | undefined {
+  return options.branch ?? options.base;
 }
 
 /**
@@ -84,30 +111,9 @@ function appendUntrackedStat(stat: string, files: string[]): string {
   return [stat.trimEnd(), ...lines, note].filter(Boolean).join('\n');
 }
 
-/** Collect the diff from the working directory or a specific base ref. */
-export function collectDiffEffect(
-  cwd: string,
-  options: DiffOptions,
-): Effect.Effect<DiffSource, ExecError, Executor> {
+/** Default: staged + unstaged vs HEAD, plus untracked new files. */
+function collectUncommittedEffect(cwd: string): Effect.Effect<DiffSource, ExecError, Executor> {
   return Effect.gen(function* () {
-    if (options.staged) {
-      const diff = yield* git(['diff', '--staged'], cwd);
-      const stat = yield* git(['diff', '--staged', '--stat'], cwd);
-      return { diff, stat, label: 'staged changes' };
-    }
-
-    if (options.base) {
-      const diff = yield* git(['diff', options.base], cwd);
-      const stat = yield* git(['diff', options.base, '--stat'], cwd);
-      return { diff, stat, label: `changes since ${options.base}` };
-    }
-
-    // Default: EVERYTHING the agent is working on but hasn't committed —
-    // tracked changes (unstaged + staged) relative to HEAD, PLUS untracked
-    // (brand-new) files. `git diff HEAD` covers only the former; untracked
-    // files are collected separately and merged so new files are reviewed too.
-    // `git diff HEAD` also fails on a repo with no commits (HEAD is unborn), so
-    // tolerate that and fall back to the bare working-directory diff.
     const headDiff = yield* git(['diff', 'HEAD'], cwd).pipe(Effect.either);
     const untracked = yield* collectUntrackedEffect(cwd);
 
@@ -115,7 +121,6 @@ export function collectDiffEffect(
     let stat: string;
     let label: string;
     if (headDiff._tag === 'Left' || !headDiff.right.trim()) {
-      // No HEAD (fresh repo) or no tracked changes → use the bare working dir.
       tracked = yield* git(['diff'], cwd);
       stat = yield* git(['diff', '--stat'], cwd);
       label = 'working directory changes';
@@ -130,20 +135,129 @@ export function collectDiffEffect(
   });
 }
 
+/** Merge-base triple-dot diff against a base branch/ref. */
+function collectBranchEffect(
+  cwd: string,
+  base: string,
+): Effect.Effect<DiffSource, ExecError, Executor> {
+  return Effect.gen(function* () {
+    const check = yield* gitEither(['rev-parse', '--verify', base], cwd);
+    if (!check.ok) {
+      return yield* failGitRef(['rev-parse', '--verify', base], `Unknown ref '${base}': not found`);
+    }
+
+    const range = `${base}...HEAD`;
+    const diff = yield* git(['diff', range], cwd);
+    const stat = yield* git(['diff', range, '--stat'], cwd);
+    return { diff, stat, label: `changes since merge-base with ${base}` };
+  });
+}
+
+type CommitRange = {
+  resolved: string;
+  hasParent: boolean;
+  range: string;
+};
+
+function resolveCommitRangeEffect(
+  cwd: string,
+  sha: string,
+): Effect.Effect<CommitRange, ExecError, Executor> {
+  return Effect.gen(function* () {
+    const check = yield* gitEither(['rev-parse', '--verify', `${sha}^{commit}`], cwd);
+    if (!check.ok) {
+      return yield* failGitRef(
+        ['rev-parse', '--verify', `${sha}^{commit}`],
+        `Unknown commit '${sha}': not found`,
+      );
+    }
+
+    const resolved = check.stdout.trim();
+    const parents = yield* git(['rev-list', '--parents', '-n', '1', resolved], cwd);
+    const parts = parents.trim().split(/\s+/);
+    const hasParent = parts.length > 1;
+    const range = hasParent ? `${parts[1]}..${resolved}` : resolved;
+    return { resolved, hasParent, range };
+  });
+}
+
+/** Single-commit patch (parent..commit, or root commit). */
+function collectCommitEffect(
+  cwd: string,
+  sha: string,
+): Effect.Effect<DiffSource, ExecError, Executor> {
+  return Effect.gen(function* () {
+    const { resolved, hasParent, range } = yield* resolveCommitRangeEffect(cwd, sha);
+    const diffArgs = hasParent ? ['diff', range] : ['show', '--format=', '--patch', resolved];
+    const statArgs = hasParent
+      ? ['diff', range, '--stat']
+      : ['show', '--format=', '--stat', resolved];
+
+    const diff = yield* git(diffArgs, cwd);
+    const stat = yield* git(statArgs, cwd);
+    return { diff, stat, label: `commit ${resolved.slice(0, 12)}` };
+  });
+}
+
+/** Collect the diff from the working directory or a specific target. */
+export function collectDiffEffect(
+  cwd: string,
+  options: DiffOptions,
+): Effect.Effect<DiffSource, ExecError, Executor> {
+  return Effect.gen(function* () {
+    if (options.commit) {
+      return yield* collectCommitEffect(cwd, options.commit);
+    }
+
+    const branch = resolveBranchRef(options);
+    if (branch) {
+      return yield* collectBranchEffect(cwd, branch);
+    }
+
+    if (options.staged) {
+      const diff = yield* git(['diff', '--staged'], cwd);
+      const stat = yield* git(['diff', '--staged', '--stat'], cwd);
+      return { diff, stat, label: 'staged changes' };
+    }
+
+    return yield* collectUncommittedEffect(cwd);
+  });
+}
+
 /** Get a list of changed file paths from the diff. */
 export function getChangedFilesEffect(
   cwd: string,
   options: DiffOptions,
 ): Effect.Effect<string[], ExecError, Executor> {
   return Effect.gen(function* () {
-    if (options.staged || options.base) {
-      const args = ['diff', '--name-only', options.staged ? '--staged' : options.base!];
-      const stdout = yield* git(args, cwd);
+    if (options.commit) {
+      const { resolved, hasParent, range } = yield* resolveCommitRangeEffect(cwd, options.commit);
+      const nameArgs = hasParent
+        ? ['diff', '--name-only', range]
+        : ['show', '--format=', '--name-only', resolved];
+      const stdout = yield* git(nameArgs, cwd);
       return splitPaths(stdout);
     }
 
-    // Default: tracked changes vs HEAD (tolerate an unborn HEAD) plus untracked
-    // files, deduped, so the changed-file list mirrors the merged default diff.
+    const branch = resolveBranchRef(options);
+    if (branch) {
+      const check = yield* gitEither(['rev-parse', '--verify', branch], cwd);
+      if (!check.ok) {
+        return yield* failGitRef(
+          ['rev-parse', '--verify', branch],
+          `Unknown ref '${branch}': not found`,
+        );
+      }
+      const range = `${branch}...HEAD`;
+      const stdout = yield* git(['diff', '--name-only', range], cwd);
+      return splitPaths(stdout);
+    }
+
+    if (options.staged) {
+      const stdout = yield* git(['diff', '--name-only', '--staged'], cwd);
+      return splitPaths(stdout);
+    }
+
     const tracked = yield* git(['diff', '--name-only', 'HEAD'], cwd).pipe(
       Effect.orElseSucceed(() => ''),
     );

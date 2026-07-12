@@ -8,9 +8,11 @@ import { ExecError, FileReadError } from '../extensions/code-reviewer/errors';
 export function fakeFileSystem(opts: {
   files?: Record<string, string>;
   dirs?: Record<string, string[]>;
+  realPaths?: Record<string, string>;
 }): FileSystemService {
   const files = opts.files ?? {};
   const dirs = opts.dirs ?? {};
+  const realPaths = opts.realPaths ?? {};
   return {
     readTextFile: (path) =>
       path in files
@@ -20,6 +22,7 @@ export function fakeFileSystem(opts: {
       path in dirs
         ? Effect.succeed(dirs[path])
         : Effect.fail(new FileReadError({ path, cause: new Error('ENOENT') })),
+    realPath: (path) => Effect.succeed(realPaths[path] ?? path),
   };
 }
 

@@ -24,7 +24,8 @@
     "test": "bun test",
     "lint": "oxlint extensions test",
     "format": "oxfmt --write extensions test",
-    "format:check": "oxfmt --check extensions test"
+    "format:check": "oxfmt --check extensions test",
+    "sync:canonical": "node scripts/sync-canonical.mjs"
   },
   "pi": {
     "extensions": [
