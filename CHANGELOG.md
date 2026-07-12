@@ -17,6 +17,17 @@
 
   **Removed** (superseded by the context learn loop): multi-pass voting and temperature jitter (`review.passes`, `review.concurrency`, `review.temperature`), `review.minVotes`, the model bake-off (`review.passModel` / `review.passModels`, `review.validate` / `review.validateModel`), and recorded rejections (`.code-review/rejections.jsonl`, `review.recordRejections`, `rejectionsFile`). When a review gets something wrong, `/review-learn` folds the lesson into `context.md` and the verifier honors it thereafter.
 
+## [0.10.0](https://github.com/jalbarrang/pi-code-reviewer/compare/v0.9.1...v0.10.0) (2026-07-12)
+
+
+### ⚠ BREAKING CHANGES
+
+* **code-reviewer:** `.code-reviewer/context.md` is now required. Legacy multi-pass, model bake-off, and rejection-store configuration is ignored.
+
+### Features
+
+* **code-reviewer:** align with canonical skill ([1702f9b](https://github.com/jalbarrang/pi-code-reviewer/commit/1702f9bdd228777d30db42f40ff72f08bf65599a))
+
 ## [0.9.1](https://github.com/jalbarrang/pi-code-reviewer/compare/v0.9.0...v0.9.1) (2026-07-12)
 
 
