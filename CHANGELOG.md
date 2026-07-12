@@ -1,5 +1,12 @@
 # @dreki-gg/pi-code-reviewer
 
+## [0.9.1](https://github.com/jalbarrang/pi-code-reviewer/compare/v0.9.0...v0.9.1) (2026-07-12)
+
+
+### Bug Fixes
+
+* migrate to pi-ai 0.80 compat imports and bump dependencies ([#5](https://github.com/jalbarrang/pi-code-reviewer/issues/5)) ([1d362e0](https://github.com/jalbarrang/pi-code-reviewer/commit/1d362e0f83bb90b8b3795a738820c248a0cea160))
+
 ## [0.9.0](https://github.com/jalbarrang/pi-code-reviewer/compare/v0.8.0...v0.9.0) (2026-07-11)
 
 
