@@ -87,7 +87,7 @@ export function makeReviewerService(resolution: ModelResolution): ReviewerServic
     complete: (request) =>
       Effect.tryPromise({
         try: async () => {
-          const { completeSimple } = await import('@earendil-works/pi-ai');
+          const { completeSimple } = await import('@earendil-works/pi-ai/compat');
           const model = resolution.byKey.get(request.modelKey) ?? resolution.defaultModel;
           const message = await completeSimple(
             model,
